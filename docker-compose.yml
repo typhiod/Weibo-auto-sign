@@ -1,0 +1,31 @@
+services:
+  weibo-sign:
+    build: .
+    container_name: weibo-sign
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      # Telegram通知
+      - NOTIFY_TYPE=telegram
+      - TG_TOKEN=你的Telegram_Bot_Token
+      - TG_CHAT_ID=你的Telegram_Chat_ID
+      # Cookie自动续期配置 (可选)
+      # - RENEW_AHEAD_DAYS=7        # 提前几天触发续期 (默认7天)
+      # - QR_TIMEOUT=300            # 等待扫码秒数 (默认300秒=5分钟)
+      # - CHECK_COOKIE_CRON=0 22 * * *  # Cookie检测时间 (默认每天22:00)
+      # Server酱通知 (可选)
+      # - NOTIFY_TYPE=serverchan
+      # - SC_KEY=
+      # SMTP邮件通知 (可选)
+      # - NOTIFY_TYPE=smtp
+      # - SMTP_HOST=smtp.qq.com
+      # - SMTP_PORT=465
+      # - SMTP_USER=你的邮箱
+      # - SMTP_PASS=授权码
+      # - SMTP_TO=接收邮箱
+    volumes:
+      # 挂载Cookie文件所在目录 (必填：改成你的实际路径)
+      # 注意：挂载整个目录而非单文件，避免自动续期写入时 inode 断开
+      - ./data:/app/data
+      # 日志持久化 (可选)
+      - ./logs:/app/logs
