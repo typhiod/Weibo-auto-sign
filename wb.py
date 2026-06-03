@@ -706,13 +706,43 @@ def main():
         if total_success > 0:
             print(f"🌟 本次新增签到 {total_success} 个超话")
     else:
-        print("⚠️  所有账户均执行失败，请检查Cookie配置")
-        # 全部失败时发送通知
-        send_notify(
-            '微博超话签到失败 - Cookie已过期',
-            f'所有{total_accounts}个账户均签到失败，请更新Cookie文件。\n时间: {time.strftime("%Y-%m-%d %H:%M:%S")}'
-        )
-        sys.exit(1)
+        print("⚠️  所有账户均执行失败，尝试自动续期Cookie...")
+        
+        # 尝试自动续期
+        renewed = False
+        try:
+            from check_cookie import do_renew
+            renewed = do_renew("签到时检测到所有账户Cookie已失效")
+        except Exception as e:
+            print(f"⚠️ 自动续期调用失败: {e}")
+        
+        if renewed:
+            print("✅ Cookie已自动更新，重新执行签到...")
+            # 重新读取Cookie并签到
+            new_cookies = get_cookies()
+            if new_cookies:
+                for i, cookie in enumerate(new_cookies, 1):
+                    if not cookie or len(cookie) < 50:
+                        continue
+                    try:
+                        signin = WeiboChaohuaSignin(cookie, i, len(new_cookies))
+                        result = signin.run()
+                        if result['success'] and result['success_count'] > 0:
+                            success_accounts += 1
+                            total_success += result['success_count']
+                            total_already_signed += result['already_signed_count']
+                            total_fail += result['fail_count']
+                            total_topics += result['total']
+                    except Exception as e:
+                        print(f"❌ 续期后重试账户{i}失败: {e}")
+        
+        if success_accounts == 0:
+            print("⚠️  Cookie续期失败或续期后签到仍失败")
+            send_notify(
+                '微博超话签到失败 - Cookie已过期',
+                f'所有{total_accounts}个账户均签到失败，请手动更新Cookie文件。\n时间: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+            )
+            sys.exit(1)
 
     # 发送每日签到汇总通知
     notify_msg = []
