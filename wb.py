@@ -378,47 +378,82 @@ class WeiboChaohuaSignin:
             success_count = 0
             already_signed_count = 0
             fail_count = 0
+            failed_list = []
             
-            for i, chaohua in enumerate(chaohua_list, 1):
-                chaohua_id = chaohua['id']
-                chaohua_name = chaohua['name']
+            def sign_batch(items, round_label=""):
+                """签到一批超话，返回 (成功数, 已签数, 失败数, 失败列表)"""
+                s_count = 0
+                a_count = 0
+                f_count = 0
+                f_list = []
                 
-                self.log(f"📝 正在签到 ({i}/{len(chaohua_list)}): {chaohua_name}")
-                
-                # 带重试的签到
-                result = None
-                for attempt in range(1, self.max_retries + 1):
-                    result = self.sign_chaohua(chaohua_id, chaohua_name)
+                for i, chaohua in enumerate(items, 1):
+                    chaohua_id = chaohua['id']
+                    chaohua_name = chaohua['name']
                     
-                    # 382001 = 频率限制，等待后重试
-                    if not result['success'] and result.get('code') == '382001':
-                        if attempt < self.max_retries:
-                            wait = 15 * attempt + random.uniform(5, 15)
-                            self.log(f"⏳ [{chaohua_name}] 被频率限制，等待 {wait:.0f}秒 后重试 ({attempt}/{self.max_retries})", 'WARNING')
-                            time.sleep(wait)
-                        continue
-                    break  # 成功或其他错误，不重试
-                
-                if result['success']:
-                    if result.get('already_signed'):
-                        self.log(f"⚠️  [{chaohua_name}] {result['msg']}", 'WARNING')
-                        already_signed_count += 1
+                    self.log(f"📝 {round_label}正在签到 ({i}/{len(items)}): {chaohua_name}")
+                    
+                    # 带重试的签到
+                    result = None
+                    for attempt in range(1, self.max_retries + 1):
+                        result = self.sign_chaohua(chaohua_id, chaohua_name)
+                        
+                        # 382001 = 频率限制，等待后重试
+                        if not result['success'] and result.get('code') == '382001':
+                            if attempt < self.max_retries:
+                                wait = 15 * attempt + random.uniform(5, 15)
+                                self.log(f"⏳ [{chaohua_name}] 被频率限制，等待 {wait:.0f}秒 后重试 ({attempt}/{self.max_retries})", 'WARNING')
+                                time.sleep(wait)
+                            continue
+                        break  # 成功或其他错误，不重试
+                    
+                    if result['success']:
+                        if result.get('already_signed'):
+                            self.log(f"⚠️  [{chaohua_name}] {result['msg']}", 'WARNING')
+                            a_count += 1
+                        else:
+                            self.log(f"✅ [{chaohua_name}] {result['msg']}", 'SUCCESS')
+                            s_count += 1
                     else:
-                        self.log(f"✅ [{chaohua_name}] {result['msg']}", 'SUCCESS')
-                        success_count += 1
+                        self.log(f"❌ [{chaohua_name}] {result['msg']}", 'ERROR')
+                        f_count += 1
+                        f_list.append(chaohua)
+                    
+                    # 添加随机延迟
+                    if i < len(items):
+                        delay = self.sign_interval + random.uniform(1.0, 3.0)
+                        time.sleep(delay)
+                    
+                    # 每批次签到后长休息，避免频率限制
+                    if i % self.batch_size == 0 and i < len(items):
+                        self.log(f"💤 已完成 {i}/{len(items)}，休息 {self.batch_pause} 秒后继续...")
+                        time.sleep(self.batch_pause)
+                
+                return s_count, a_count, f_count, f_list
+            
+            # ── 第一轮签到 ──
+            s, a, f, failed_list = sign_batch(chaohua_list)
+            success_count += s
+            already_signed_count += a
+            fail_count += f
+            
+            # ── 补签：如果有失败的，等待后再来一轮 ──
+            if failed_list:
+                retry_wait = 60
+                self.log(f"🔄 第一轮有 {len(failed_list)} 个失败，等待 {retry_wait} 秒后开始补签...", 'WARNING')
+                time.sleep(retry_wait)
+                
+                s2, a2, f2, still_failed = sign_batch(failed_list, round_label="[补签] ")
+                success_count += s2
+                already_signed_count += a2
+                # 更新失败数：减去补签成功的
+                fail_count = fail_count - (s2 + a2) + f2 - len(failed_list) + len(still_failed)
+                fail_count = len(still_failed)  # 最终失败数 = 补签后仍然失败的
+                
+                if still_failed:
+                    self.log(f"⚠️ 补签后仍有 {len(still_failed)} 个失败", 'WARNING')
                 else:
-                    self.log(f"❌ [{chaohua_name}] {result['msg']}", 'ERROR')
-                    fail_count += 1
-                
-                # 添加随机延迟
-                if i < len(chaohua_list):
-                    delay = self.sign_interval + random.uniform(1.0, 3.0)
-                    time.sleep(delay)
-                
-                # 每批次签到后长休息，避免频率限制
-                if i % self.batch_size == 0 and i < len(chaohua_list):
-                    self.log(f"💤 已完成 {i}/{len(chaohua_list)}，休息 {self.batch_pause} 秒后继续...")
-                    time.sleep(self.batch_pause)
+                    self.log(f"🎉 补签全部成功！", 'SUCCESS')
             
             # 输出统计结果
             self.log("=" * 30)
