@@ -120,8 +120,11 @@ class WeiboChaohuaSignin:
         self._init_session()
 
         # 配置
-        self.sign_interval = 1.5  # 签到间隔(秒)
+        self.sign_interval = 3.0    # 签到间隔(秒)
         self.account_interval = 10  # 账户间间隔(秒)
+        self.max_retries = 3        # 单个超话最大重试次数
+        self.batch_size = 10        # 每批签到数量
+        self.batch_pause = 30       # 批次间休息秒数
 
     def _parse_cookie(self, cookie):
         """解析Cookie字符串为字典"""
@@ -382,7 +385,19 @@ class WeiboChaohuaSignin:
                 
                 self.log(f"📝 正在签到 ({i}/{len(chaohua_list)}): {chaohua_name}")
                 
-                result = self.sign_chaohua(chaohua_id, chaohua_name)
+                # 带重试的签到
+                result = None
+                for attempt in range(1, self.max_retries + 1):
+                    result = self.sign_chaohua(chaohua_id, chaohua_name)
+                    
+                    # 382001 = 频率限制，等待后重试
+                    if not result['success'] and result.get('code') == '382001':
+                        if attempt < self.max_retries:
+                            wait = 15 * attempt + random.uniform(5, 15)
+                            self.log(f"⏳ [{chaohua_name}] 被频率限制，等待 {wait:.0f}秒 后重试 ({attempt}/{self.max_retries})", 'WARNING')
+                            time.sleep(wait)
+                        continue
+                    break  # 成功或其他错误，不重试
                 
                 if result['success']:
                     if result.get('already_signed'):
@@ -395,10 +410,15 @@ class WeiboChaohuaSignin:
                     self.log(f"❌ [{chaohua_name}] {result['msg']}", 'ERROR')
                     fail_count += 1
                 
-                # 添加随机延迟，避免请求过快
+                # 添加随机延迟
                 if i < len(chaohua_list):
-                    delay = self.sign_interval + random.uniform(0.5, 1.0)
+                    delay = self.sign_interval + random.uniform(1.0, 3.0)
                     time.sleep(delay)
+                
+                # 每批次签到后长休息，避免频率限制
+                if i % self.batch_size == 0 and i < len(chaohua_list):
+                    self.log(f"💤 已完成 {i}/{len(chaohua_list)}，休息 {self.batch_pause} 秒后继续...")
+                    time.sleep(self.batch_pause)
             
             # 输出统计结果
             self.log("=" * 30)
