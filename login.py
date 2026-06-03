@@ -49,7 +49,7 @@ def get_qr_code():
     """获取微博登录二维码"""
     # Step 1: 获取二维码参数
     ts = int(time.time() * 1000)
-    resp = SESSION.get(f'https://login.weibo.com/sso/qrcode/web/fetch?entry=weibo&size=160&_={ts}', timeout=15)
+    resp = SESSION.get(f'https://login.sina.com.cn/sso/qrcode/image?entry=weibo&size=160&_={ts}', timeout=15)
     data = resp.json()
     if data.get('retcode') != 20000000:
         raise Exception(f"获取二维码失败: {data}")
@@ -70,7 +70,7 @@ def poll_qr_login(qrid, timeout_seconds=300):
     while time.time() - start < timeout_seconds:
         ts = int(time.time() * 1000)
         resp = SESSION.get(
-            f'https://login.weibo.com/sso/qrcode/web/check?qrid={qrid}&entry=weibo&_={ts}',
+            f'https://login.sina.com.cn/sso/qrcode/check?qrid={qrid}&entry=weibo&_={ts}',
             timeout=15
         )
         data = resp.json()
