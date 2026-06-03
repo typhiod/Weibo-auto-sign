@@ -48,14 +48,32 @@ def send_telegram_message(text):
 def get_qr_code():
     """获取微博登录二维码"""
     # Step 1: 获取二维码参数
-    ts = int(time.time() * 1000)
-    resp = SESSION.get(f'https://login.sina.com.cn/sso/qrcode/image?entry=weibo&size=160&_={ts}', timeout=15)
-    data = resp.json()
+    ts = int(time.time() * 10000)
+    url = f'https://login.sina.com.cn/sso/qrcode/image?entry=miniblog&size=180&callback=STK_{ts}'
+    resp = SESSION.get(url, timeout=15)
+    
+    # 解析 JSONP (e.g. STK_123({...}))
+    match = re.search(r'\((.*)\)', resp.text)
+    if not match:
+        raise Exception(f"获取二维码解析失败: {resp.text}")
+        
+    data = json.loads(match.group(1))
     if data.get('retcode') != 20000000:
         raise Exception(f"获取二维码失败: {data}")
 
     qrid = data['data']['qrid']
-    image_url = f"https:{data['data']['image']}"
+    # Sina 新接口返回的是图片服务参数，需自己拼接
+    if 'image' in data['data'] and 'api_key=' in data['data']['image']:
+        image_url = data['data']['image']
+        if image_url.startswith('//'):
+            image_url = 'https:' + image_url
+    else:
+        # 兼容备用
+        api_key = re.search('.*?"api_key":"(.*)?",', resp.text)
+        if api_key:
+            image_url = f"https://v2.qr.weibo.cn/inf/gen?api_key={api_key.group(1)}"
+        else:
+            raise Exception("未能从响应中提取 api_key 或 image_url")
 
     # Step 2: 下载二维码图片
     img_resp = SESSION.get(image_url, timeout=15)
@@ -68,12 +86,19 @@ def poll_qr_login(qrid, timeout_seconds=300):
     """轮询扫码结果"""
     start = time.time()
     while time.time() - start < timeout_seconds:
-        ts = int(time.time() * 1000)
+        ts = int(time.time() * 10000)
         resp = SESSION.get(
-            f'https://login.sina.com.cn/sso/qrcode/check?qrid={qrid}&entry=weibo&_={ts}',
+            f'https://login.sina.com.cn/sso/qrcode/check?qrid={qrid}&entry=miniblog&callback=STK_{ts}',
             timeout=15
         )
-        data = resp.json()
+        
+        match = re.search(r'\((.*)\)', resp.text)
+        if not match:
+            print(f"\n[-] 轮询解析失败: {resp.text}")
+            time.sleep(2)
+            continue
+            
+        data = json.loads(match.group(1))
         retcode = data.get('retcode', 0)
 
         if retcode == 20000000:
