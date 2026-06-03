@@ -123,11 +123,34 @@ def poll_qr_login(qrid, timeout_seconds=300):
     return None
 
 
-def process_login(alt_url):
+def process_login(alt_token):
     """处理登录重定向，提取Cookie"""
-    resp = SESSION.get(alt_url, allow_redirects=True, timeout=30)
+    # 1. 构造获取跨域登录链接的 API
+    ts = int(time.time() * 10000)
+    alturl = (f'https://login.sina.com.cn/sso/login.php?entry=miniblog&returntype=TEXT'
+              f'&crossdomain=1&cdult=3&domain=weibo.com&alt={alt_token}&savestate=30'
+              f'&callback=STK_{ts}')
+    
+    print("[*] 正在换取跨域凭证...")
+    resp = SESSION.get(alturl, timeout=30)
+    
+    match = re.search(r'\((.*)\)', resp.text)
+    if not match:
+        raise Exception(f"跨域票据获取失败: {resp.text}")
+        
+    data = json.loads(match.group(1))
+    crossDomainUrlList = data.get('crossDomainUrlList', [])
+    
+    if not crossDomainUrlList:
+        raise Exception(f"未能获取到跨域登录链接: {data}")
+        
+    # 2. 依次请求跨域链接来写入最终 Cookie
+    print(f"[*] 获取到 {len(crossDomainUrlList)} 个跨域验证链接，正在写入Cookie...")
+    for url in crossDomainUrlList:
+        req_url = url + '&action=login' if 'action=login' not in url else url
+        SESSION.get(req_url, timeout=15)
 
-    # 最终可能重定向到weibo.com，从cookie jar提取
+    # 3. 最终从 session 提取 weibo.com cookie
     cookies = []
     for cookie in SESSION.cookies:
         cookies.append(f"{cookie.name}={cookie.value}")
