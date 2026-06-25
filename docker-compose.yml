@@ -3,8 +3,12 @@ services:
     build: .
     container_name: weibo-sign
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - TZ=Asia/Shanghai
+      - SIGN_CRON=0 0,6 * * *      # 分两段签到：00:00 和 06:00，对抗微博频率限制
       # Telegram通知
       - NOTIFY_TYPE=telegram
       - TG_TOKEN=你的Telegram_Bot_Token
