@@ -119,12 +119,12 @@ class WeiboChaohuaSignin:
         # 访问微博首页获取最新的XSRF-TOKEN和uid
         self._init_session()
 
-        # 配置
-        self.sign_interval = 3.0    # 签到间隔(秒)
+        # 配置 (为了对抗微博日益严格的 382001 风控，显著减慢速度)
+        self.sign_interval = 8.0    # 签到基础间隔(秒)，实际还会加上随机延迟
         self.account_interval = 10  # 账户间间隔(秒)
-        self.max_retries = 3        # 单个超话最大重试次数
-        self.batch_size = 10        # 每批签到数量
-        self.batch_pause = 30       # 批次间休息秒数
+        self.max_retries = 2        # 单个超话最大重试次数 (降低无意义重试)
+        self.batch_size = 6         # 每批签到数量 (原10，现降为6)
+        self.batch_pause = 60       # 批次间休息秒数 (原30，现增至60)
 
     def _parse_cookie(self, cookie):
         """解析Cookie字符串为字典"""
@@ -387,6 +387,8 @@ class WeiboChaohuaSignin:
                 f_count = 0
                 f_list = []
                 
+                consecutive_382001_failures = 0
+                
                 for i, chaohua in enumerate(items, 1):
                     chaohua_id = chaohua['id']
                     chaohua_name = chaohua['name']
@@ -408,6 +410,7 @@ class WeiboChaohuaSignin:
                         break  # 成功或其他错误，不重试
                     
                     if result['success']:
+                        consecutive_382001_failures = 0  # 成功则重置计数器
                         if result.get('already_signed'):
                             self.log(f"⚠️  [{chaohua_name}] {result['msg']}", 'WARNING')
                             a_count += 1
@@ -418,6 +421,21 @@ class WeiboChaohuaSignin:
                         self.log(f"❌ [{chaohua_name}] {result['msg']}", 'ERROR')
                         f_count += 1
                         f_list.append(chaohua)
+                        
+                        # 熔断机制：如果连续出现 382001，直接终止后续所有签到
+                        if not result['success'] and result.get('code') == '382001':
+                            consecutive_382001_failures += 1
+                            if consecutive_382001_failures >= 3:
+                                self.log(f"⛔ 触发熔断保护：连续 {consecutive_382001_failures} 个超话触发 382001 频率限制，账号已被微博拉黑(冷却期)，提前终止今日任务！", 'ERROR')
+                                # 将剩下的也算作失败
+                                remaining = len(items) - i
+                                if remaining > 0:
+                                    self.log(f"⏩ 跳过剩余 {remaining} 个超话的签到", 'WARNING')
+                                    f_count += remaining
+                                    f_list.extend(items[i:])
+                                break
+                        else:
+                            consecutive_382001_failures = 0
                     
                     # 添加随机延迟
                     if i < len(items):
