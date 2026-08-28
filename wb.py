@@ -730,7 +730,7 @@ def main():
         renewed = False
         try:
             from check_cookie import do_renew
-            renewed = do_renew("签到时检测到所有账户Cookie已失效")
+            renewed = do_renew("签到时检测到所有账户Cookie已失效", trigger_sign=False)
         except Exception as e:
             print(f"⚠️ 自动续期调用失败: {e}")
         
@@ -745,7 +745,7 @@ def main():
                     try:
                         signin = WeiboChaohuaSignin(cookie, i, len(new_cookies))
                         result = signin.run()
-                        if result['success'] and result['success_count'] > 0:
+                        if result['success']:
                             success_accounts += 1
                             total_success += result['success_count']
                             total_already_signed += result['already_signed_count']

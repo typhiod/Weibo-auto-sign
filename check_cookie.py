@@ -147,7 +147,7 @@ def get_cookie_str_from_file():
 
 # ── 续期流程 ─────────────────────────────────────────────────
 
-def do_renew(reason):
+def do_renew(reason, trigger_sign=True):
     """
     触发 Telegram 扫码续期流程。
     返回 True 表示成功，False 表示失败/超时。
@@ -175,7 +175,7 @@ def do_renew(reason):
         # 2. 发送二维码到 Telegram
         caption = (
             "📱 请用微博 APP 扫描此二维码重新登录\n"
-            "✅ 扫码并确认后 Cookie 将自动更新\n"
+            "✅ 扫码并确认后 Cookie 将自动更新并立即执行签到\n"
             f"⏰ 二维码有效期：5 分钟"
         )
         if not send_telegram_photo(qr_bytes, caption):
@@ -202,9 +202,21 @@ def do_renew(reason):
         send_telegram_message(
             "✅ 微博 Cookie 已自动更新成功！\n"
             f"📅 新 Cookie 有效期约 1~3 个月\n"
-            f"🕛 今晚 00:00 将使用新 Cookie 正常签到"
+            "🚀 正在为您立即执行超话签到，避免当天漏签..."
         )
         print("[+] Cookie 续期成功，新 Cookie 已写入文件")
+
+        # 5. 自动执行一次签到，避免当天漏签
+        if trigger_sign:
+            try:
+                print("[*] 正在执行自动签到任务...")
+                from wb import main as run_wb_main
+                run_wb_main()
+            except SystemExit:
+                pass
+            except Exception as e:
+                print(f"[!] 自动签到触发异常: {e}")
+
         return True
 
     except Exception as e:
