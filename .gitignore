@@ -59,3 +59,8 @@ weibo.com_cookies.txt
 cookies.txt
 config.ini
 *.cookie
+.cookie_cache/
+.cookie_tasks.lock
+.cron_env
+.signed_today.json
+.signed_today.json.tmp

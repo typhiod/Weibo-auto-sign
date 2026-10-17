@@ -17,6 +17,7 @@ services:
       # - RENEW_AHEAD_DAYS=7        # 提前几天触发续期 (默认7天)
       # - QR_TIMEOUT=300            # 等待扫码秒数 (默认300秒=5分钟)
       # - CHECK_COOKIE_CRON=0 22 * * *  # Cookie检测时间 (默认每天22:00)
+      # - HEARTBEAT_CRON=5 */6 * * *    # 保活时间 (默认每6小时第5分钟)
       # Server酱通知 (可选)
       # - NOTIFY_TYPE=serverchan
       # - SC_KEY=

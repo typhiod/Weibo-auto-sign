@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """
-微博扫码登录 - 获取长期有效Cookie
+微博扫码登录 - 获取并保存服务端实际签发的 Cookie
 通过Telegram接收二维码，手机微博扫码即可登录
-Cookie有效期通常1-3个月
+有效期由微博服务端决定
 """
 import os
 import sys
 import json
 import time
 import requests
-import base64
 import re
-from io import BytesIO
+from cookie_store import (
+    TaskBusy, cookie_header, cookie_value, default_cookie_file, load_accounts,
+    make_session, parse_cookie_content, save_cookie_jar, task_lock, validate_session,
+)
 
 TG_TOKEN = os.getenv('TG_TOKEN', '')
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', '')
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'weibo.com_cookies.txt')
-# 兼容旧路径：如果 data/ 目录不存在则回退到脚本同目录
-if not os.path.isdir(os.path.dirname(COOKIE_FILE)):
-    COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weibo.com_cookies.txt')
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-    'Referer': 'https://weibo.com/',
-})
+COOKIE_FILE = str(default_cookie_file())
+SESSION = make_session('')
 
 
 def send_telegram_photo(image_bytes, caption=''):
@@ -42,24 +36,33 @@ def send_telegram_message(text):
         print(text)
         return
     url = f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage'
-    requests.post(url, json={'chat_id': TG_CHAT_ID, 'text': text}, timeout=15)
+    try:
+        response = requests.post(url, json={'chat_id': TG_CHAT_ID, 'text': text}, timeout=15)
+        response.raise_for_status()
+        return response.json().get('ok', False)
+    except (requests.exceptions.RequestException, ValueError) as error:
+        print(f'[!] Telegram 文本通知发送失败 ({type(error).__name__})')
+        return False
 
 
 def get_qr_code():
     """获取微博登录二维码"""
+    # 每次扫码使用干净的会话，避免混入上一个账户的凭证。
+    SESSION.cookies.clear()
     # Step 1: 获取二维码参数
     ts = int(time.time() * 10000)
     url = f'https://login.sina.com.cn/sso/qrcode/image?entry=miniblog&size=180&callback=STK_{ts}'
     resp = SESSION.get(url, timeout=15)
+    resp.raise_for_status()
     
     # 解析 JSONP (e.g. STK_123({...}))
     match = re.search(r'\((.*)\)', resp.text)
     if not match:
-        raise Exception(f"获取二维码解析失败: {resp.text}")
+        raise Exception("获取二维码解析失败，响应不是预期的 JSONP")
         
     data = json.loads(match.group(1))
     if data.get('retcode') != 20000000:
-        raise Exception(f"获取二维码失败: {data}")
+        raise Exception(f"获取二维码失败 (retcode={data.get('retcode')})")
 
     qrid = data['data']['qrid']
     # Sina 新接口返回的是图片服务参数，需自己拼接
@@ -77,6 +80,7 @@ def get_qr_code():
 
     # Step 2: 下载二维码图片
     img_resp = SESSION.get(image_url, timeout=15)
+    img_resp.raise_for_status()
 
     print(f"[+] 获取到二维码, qrid={qrid}")
     return qrid, img_resp.content
@@ -87,18 +91,20 @@ def poll_qr_login(qrid, timeout_seconds=300):
     start = time.time()
     while time.time() - start < timeout_seconds:
         ts = int(time.time() * 10000)
-        resp = SESSION.get(
-            f'https://login.sina.com.cn/sso/qrcode/check?qrid={qrid}&entry=miniblog&callback=STK_{ts}',
-            timeout=15
-        )
-        
-        match = re.search(r'\((.*)\)', resp.text)
-        if not match:
-            print(f"\n[-] 轮询解析失败: {resp.text}")
+        try:
+            resp = SESSION.get(
+                f'https://login.sina.com.cn/sso/qrcode/check?qrid={qrid}&entry=miniblog&callback=STK_{ts}',
+                timeout=15
+            )
+            match = re.search(r'\((.*)\)', resp.text)
+            data = json.loads(match.group(1)) if match else None
+        except (requests.exceptions.RequestException, ValueError) as error:
+            # 单次网络抖动不能让用户已经扫过的二维码作废
+            print(f'\n[-] 轮询请求失败 ({type(error).__name__})，稍后重试')
+            data = None
+        if not isinstance(data, dict):
             time.sleep(2)
             continue
-            
-        data = json.loads(match.group(1))
         retcode = data.get('retcode', 0)
 
         if retcode == 20000000:
@@ -133,72 +139,43 @@ def process_login(alt_token):
     
     print("[*] 正在换取跨域凭证...")
     resp = SESSION.get(alturl, timeout=30)
+    resp.raise_for_status()
     
     match = re.search(r'\((.*)\)', resp.text)
     if not match:
-        raise Exception(f"跨域票据获取失败: {resp.text}")
+        raise Exception("跨域票据获取失败，响应不是预期的 JSONP")
         
     data = json.loads(match.group(1))
     crossDomainUrlList = data.get('crossDomainUrlList', [])
     
     if not crossDomainUrlList:
-        raise Exception(f"未能获取到跨域登录链接: {data}")
+        raise Exception("未能获取到跨域登录链接")
         
     # 2. 依次请求跨域链接来写入最终 Cookie
     print(f"[*] 获取到 {len(crossDomainUrlList)} 个跨域验证链接，正在写入Cookie...")
     for url in crossDomainUrlList:
         req_url = url + '&action=login' if 'action=login' not in url else url
-        SESSION.get(req_url, timeout=15)
+        SESSION.get(req_url, timeout=15).raise_for_status()
 
     # 3. 最终从 session 提取 weibo.com cookie
-    cookies = []
-    for cookie in SESSION.cookies:
-        cookies.append(f"{cookie.name}={cookie.value}")
-
-    if not cookies:
-        raise Exception("未能获取到登录Cookie")
-
-    # 检查关键字段
-    cookie_str = '; '.join(cookies)
-    has_sub = 'SUB=' in cookie_str
-    has_s = 'SUBP=' in cookie_str or 'ALF=' in cookie_str
-
-    print(f"[+] 获取到 {len(cookies)} 个Cookie字段")
-    print(f"[+] SUB: {'有' if has_sub else '无'}")
-    print(f"[+] 长期凭证: {'有' if has_s else '无'}")
-
-    return cookie_str
+    if not cookie_value(SESSION.cookies, 'SUB'):
+        raise Exception('未获取到 weibo.com 的 SUB 登录凭证，保留原 Cookie')
+    valid, reason = validate_session(SESSION)
+    if valid is not True:
+        raise Exception(f'扫码后的登录验证未通过: {reason}；保留原 Cookie')
+    print(f'[+] 登录验证通过，获取到 {len(SESSION.cookies)} 个 Cookie 字段')
+    return cookie_header(SESSION.cookies)
 
 
-def save_cookie_netscape(cookie_str):
-    """保存为Netscape格式（兼容现有脚本）"""
-    cookies = {}
-    for item in cookie_str.split('; '):
-        if '=' in item:
-            k, v = item.split('=', 1)
-            cookies[k] = v
-
-    lines = [
-        "# Netscape HTTP Cookie File",
-        "# https://curl.haxx.se/rfc/cookie_spec.html",
-        "# This is a generated file! Do not edit.",
-        ""
-    ]
-
-    # 模拟过期时间：能设的就设远一点（一年后）
-    far_expiry = int(time.time()) + 365 * 24 * 3600
-
-    for name, value in cookies.items():
-        # domain flag path secure expiry name value
-        lines.append(f".weibo.com\tTRUE\t/\tTRUE\t{far_expiry}\t{name}\t{value}")
-
-    with open(COOKIE_FILE, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-
-    print(f"[+] Cookie已保存到 {COOKIE_FILE}")
+def save_cookie_netscape(cookie_str=None, cookie_file=None):
+    """扫码流程保存完整 CookieJar；兼容字符串调用时不伪造过期时间。"""
+    jar = SESSION.cookies if cookie_str is None else parse_cookie_content(cookie_str)
+    target = cookie_file or COOKIE_FILE
+    save_cookie_jar(jar, target)
+    print('[+] Cookie 已保存，保留真实域名、路径和过期时间')
 
 
-def main():
+def main(account_index=1):
     print("=" * 50)
     print("  微博扫码登录工具")
     print("=" * 50)
@@ -209,6 +186,10 @@ def main():
         sys.exit(1)
 
     try:
+        accounts = load_accounts()
+        if accounts and not 1 <= account_index <= len(accounts):
+            raise ValueError('账户编号超出范围')
+        account = accounts[account_index - 1] if accounts else None
         # 1. 获取二维码
         qrid, qr_bytes = get_qr_code()
 
@@ -226,18 +207,26 @@ def main():
             sys.exit(1)
 
         # 4. 获取Cookie
-        cookie_str = process_login(alt_url)
+        process_login(alt_url)
 
         # 5. 保存
-        save_cookie_netscape(cookie_str)
+        save_cookie_netscape(cookie_file=account.path if account else COOKIE_FILE)
 
-        send_telegram_message(f'✅ 微博登录成功!\nCookie字段数: {len(cookie_str.split("; "))}\n有效期: 约1-3个月')
+        send_telegram_message(f'✅ 微博账户{account_index}登录成功!\nCookie字段数: {len(SESSION.cookies)}\n已保留服务端实际过期时间，有效期以微博登录状态为准')
 
     except Exception as e:
-        print(f"[-] 登录失败: {e}")
-        send_telegram_message(f'❌ 微博登录失败: {e}')
+        print(f"[-] 登录失败 ({type(e).__name__})")
+        send_telegram_message(f'❌ 微博登录失败 ({type(e).__name__})，原 Cookie 已保留，请检查登录日志')
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description='微博扫码登录')
+    parser.add_argument('--account', type=int, default=1, help='需要更新的账户编号，默认 1')
+    args = parser.parse_args()
+    try:
+        with task_lock():
+            main(args.account)
+    except TaskBusy as error:
+        print(f'[*] {error}')

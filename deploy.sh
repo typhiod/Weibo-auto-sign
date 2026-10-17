@@ -42,7 +42,7 @@ echo "[+] requests 已安装"
 
 # 4. 检查Cookie文件
 COOKIE_FILE=""
-for f in "weibo.com_cookies.txt" "cookie.txt" "cookies.txt"; do
+for f in "data/weibo.com_cookies.txt" "data/cookie.txt" "weibo.com_cookies.txt" "cookie.txt" "cookies.txt"; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
         COOKIE_FILE="$f"
         echo "[+] 检测到Cookie文件: $f"
@@ -62,19 +62,23 @@ fi
 echo ""
 echo "[*] 配置 crontab 定时任务..."
 
+# cron 不读取 ~/.bashrc，把当前 shell 中已 export 的配置写入环境文件供定时任务加载
+CRON_ENV="$SCRIPT_DIR/.cron_env"
+: > "$CRON_ENV"
+chmod 600 "$CRON_ENV"
+for var_name in TZ NOTIFY_TYPE TG_TOKEN TG_CHAT_ID SC_KEY PUSH_KEY SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_TO WEIBO_COOKIE WEIBO_COOKIES RENEW_AHEAD_DAYS QR_TIMEOUT; do
+    if [ -n "${!var_name:-}" ]; then
+        printf 'export %s=%q
+' "$var_name" "${!var_name}" >> "$CRON_ENV"
+    fi
+done
+echo "[+] 已写入定时任务环境文件: $CRON_ENV ($(wc -l < "$CRON_ENV") 项)"
+ENV_PREFIX=". \"$CRON_ENV\" >/dev/null 2>&1;"
+
 # 生成crontab条目
-CRON_SIGN="0 12 * * * cd $SCRIPT_DIR && python3 $SCRIPT_NAME >> $SCRIPT_DIR/sign.log 2>&1"
-CRON_HEARTBEAT="0 */6 * * * cd $SCRIPT_DIR && python3 -c \"
-import requests, os, sys
-sys.path.insert(0, '$SCRIPT_DIR')
-from wb import get_cookies
-cookies = get_cookies()
-if cookies:
-    s = requests.Session()
-    s.cookies.update({k:v for k,v in [c.split('=',1) for c in cookies[0].split('; ') if '=' in c]})
-    s.get('https://weibo.com', timeout=15)
-    print(f'Heartbeat OK: {len(cookies[0])} bytes cookie')
-\" >> $SCRIPT_DIR/heartbeat.log 2>&1"
+CRON_SIGN="0 12 * * * $ENV_PREFIX cd \"$SCRIPT_DIR\" && python3 $SCRIPT_NAME >> \"$SCRIPT_DIR/sign.log\" 2>&1"
+CRON_HEARTBEAT="5 */6 * * * $ENV_PREFIX cd \"$SCRIPT_DIR\" && python3 heartbeat.py >> \"$SCRIPT_DIR/heartbeat.log\" 2>&1"
+CRON_CHECK="0 22 * * * $ENV_PREFIX cd \"$SCRIPT_DIR\" && python3 check_cookie.py >> \"$SCRIPT_DIR/check_cookie.log\" 2>&1"
 
 # 移除旧的任务
 (crontab -l 2>/dev/null | grep -v "$CRON_MARKER") | crontab - || true
@@ -86,12 +90,14 @@ if cookies:
     echo "$CRON_MARKER-begin"
     echo "$CRON_SIGN $CRON_MARKER"
     echo "$CRON_HEARTBEAT $CRON_MARKER"
+    echo "$CRON_CHECK $CRON_MARKER"
     echo "$CRON_MARKER-end"
 ) | crontab -
 
 echo "[+] 已添加定时任务:"
-echo "    签到: 每天 12:00 (北京时间)"
-echo "    保活: 每 6 小时访问微博首页"
+echo "    签到: 每天 12:00 (系统时区)"
+echo "    保活: 每 6 小时第 5 分钟验证登录并保存 Cookie"
+echo "    Cookie检测: 每天 22:00"
 
 # 6. 通知配置提示
 echo ""
@@ -114,7 +120,8 @@ echo "       export SMTP_USER=你的邮箱"
 echo "       export SMTP_PASS=授权码"
 echo "       export SMTP_TO=接收邮箱"
 echo ""
-echo "  添加以上 export 到 ~/.bashrc 或 /etc/environment"
+echo "  先在当前终端执行以上 export，再重新运行 bash deploy.sh"
+echo "  (cron 不读取 ~/.bashrc，配置会写入 $SCRIPT_DIR/.cron_env)"
 echo ""
 
 # 7. 测试运行
@@ -141,6 +148,7 @@ echo ""
 echo "  日志文件:"
 echo "    签到日志: $SCRIPT_DIR/sign.log"
 echo "    保活日志: $SCRIPT_DIR/heartbeat.log"
+echo "    检测日志: $SCRIPT_DIR/check_cookie.log"
 echo ""
 echo "  常用命令:"
 echo "    crontab -l              # 查看定时任务"

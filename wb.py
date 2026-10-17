@@ -18,6 +18,10 @@ import json
 import time
 import random
 import requests
+from cookie_store import (
+    AuthenticationError, CookieAccount, TaskBusy, cookie_header, cookie_value, data_dir,
+    load_accounts, make_session, parse_cookie_content, response_requires_login, task_lock,
+)
 
 # Windows控制台UTF-8支持
 if sys.platform == 'win32':
@@ -46,7 +50,8 @@ def send_notify(title, content, notify_type=None):
                 else:
                     print(f"⚠️ 通知发送失败: {result.get('message', '')}")
             except Exception as e:
-                print(f"⚠️ 通知发送异常: {e}")
+                # 异常文本含请求 URL，会带出 SendKey，只打印类型
+                print(f"⚠️ 通知发送异常 ({type(e).__name__})")
 
     elif notify_type == 'smtp':
         smtp_host = os.getenv('SMTP_HOST', '')
@@ -67,17 +72,18 @@ def send_notify(title, content, notify_type=None):
                     s.sendmail(smtp_user, [smtp_to], msg.as_string())
                 print(f"📧 邮件已发送至 {smtp_to}")
             except Exception as e:
-                print(f"⚠️ 邮件发送异常: {e}")
+                print(f"⚠️ 邮件发送异常 ({type(e).__name__})")
 
     elif notify_type == 'telegram':
         tg_token = os.getenv('TG_TOKEN', '')
         tg_chat_id = os.getenv('TG_CHAT_ID', '')
         if tg_token and tg_chat_id:
             try:
-                text = f"*{title}*\n\n{content}"
+                # 纯文本发送，避免内容中的 _ * 等字符导致 Markdown 解析失败
+                text = f"{title}\n\n{content}"
                 resp = requests.post(
                     f'https://api.telegram.org/bot{tg_token}/sendMessage',
-                    json={'chat_id': tg_chat_id, 'text': text, 'parse_mode': 'Markdown'},
+                    json={'chat_id': tg_chat_id, 'text': text},
                     timeout=15
                 )
                 result = resp.json()
@@ -86,7 +92,8 @@ def send_notify(title, content, notify_type=None):
                 else:
                     print(f"⚠️ Telegram通知失败: {result.get('description', '')}")
             except Exception as e:
-                print(f"⚠️ Telegram通知异常: {e}")
+                # 异常文本含请求 URL，会带出 Bot Token，只打印类型
+                print(f"⚠️ Telegram通知异常 ({type(e).__name__})")
 
     elif notify_type:
         print(f"⚠️ 不支持的通知类型: {notify_type}")
@@ -97,8 +104,11 @@ class WeiboChaohuaSignin:
         self.total_accounts = total_accounts
         self.account_name = f"账户{account_index}"
         self.user_info = {}
+        self.cookie_account = cookie if isinstance(cookie, CookieAccount) else None
+        self.authenticated = False
+        self.auth_expired = False
 
-        self.session = requests.Session()
+        self.session = make_session(cookie.jar if self.cookie_account else cookie)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -112,10 +122,6 @@ class WeiboChaohuaSignin:
             'sec-fetch-dest': 'empty',
         })
 
-        # 解析Cookie字符串为字典
-        cookie_dict = self._parse_cookie(cookie)
-        self.session.cookies.update(cookie_dict)
-
         # 访问微博首页获取最新的XSRF-TOKEN和uid
         self._init_session()
 
@@ -126,29 +132,17 @@ class WeiboChaohuaSignin:
         self.batch_size = 6         # 每批签到数量 (原10，现降为6)
         self.batch_pause = 60       # 批次间休息秒数 (原30，现增至60)
 
-    def _parse_cookie(self, cookie):
-        """解析Cookie字符串为字典"""
-        cookies = {}
-        try:
-            cookie = cookie.strip().replace('\n', '').replace('\r', '')
-            if isinstance(cookie, bytes):
-                cookie = cookie.decode('utf-8', errors='ignore')
-            for item in cookie.split(';'):
-                item = item.strip()
-                if '=' in item:
-                    key, value = item.split('=', 1)
-                    cookies[key.strip()] = value.strip()
-        except Exception as e:
-            self.log(f"Cookie解析失败: {str(e)}", 'ERROR')
-        return cookies
-
     def _init_session(self):
         """访问微博首页，获取最新的XSRF-TOKEN和uid"""
         try:
             resp = self.session.get('https://weibo.com', timeout=15, allow_redirects=True)
+            if response_requires_login(resp):
+                self.auth_expired = True
+                raise AuthenticationError('首页明确要求重新登录')
+            resp.raise_for_status()
             self.user_info['uid'] = resp.headers.get('x-log-uid', '')
             # 从Cookie jar中获取XSRF-TOKEN
-            self.xsrf_token = self.session.cookies.get('XSRF-TOKEN', '')
+            self.xsrf_token = cookie_value(self.session.cookies, 'XSRF-TOKEN')
             if self.xsrf_token:
                 self.session.headers['X-XSRF-TOKEN'] = self.xsrf_token
             self.log(f"会话初始化成功 (uid: {self.user_info.get('uid', 'N/A')}, xsrf: {'有' if self.xsrf_token else '无'}, status: {resp.status_code})")
@@ -161,10 +155,7 @@ class WeiboChaohuaSignin:
         """获取用户基本信息"""
         if self.user_info.get('name'):
             return self.user_info['name']
-        sub = self.session.cookies.get('SUB', '')
-        if sub:
-            return f"用户{sub[:8]}..."
-        return "未知用户"
+        return f'账户{self.account_index}'
 
     def update_user_info(self):
         """通过API获取用户昵称等信息"""
@@ -228,6 +219,8 @@ class WeiboChaohuaSignin:
             }
 
             response = self.session.get(url, params=params, headers=headers, timeout=15)
+            if response_requires_login(response):
+                raise AuthenticationError('超话列表接口要求重新登录')
 
             if response.status_code != 200:
                 self.log(f"HTTP状态码: {response.status_code}, 响应内容: {response.text[:300]}", 'WARNING')
@@ -243,18 +236,17 @@ class WeiboChaohuaSignin:
                 self.log(f"JSON解析失败，响应内容: {response.text[:200]}...", 'ERROR')
                 raise Exception(f"JSON解析失败: {str(e)}")
             
+            if response_requires_login(response, data):
+                raise AuthenticationError('超话列表接口明确返回登录失效')
             if data.get('ok') != 1:
                 error_msg = data.get('msg', '') or '未知错误(空msg)'
-                ok_code = data.get('ok', '')
-                # ok=-100 表示需要登录
-                if ok_code == -100 or 'login' in str(data.get('url', '')).lower():
-                    raise Exception(f"Cookie已过期或无效，需要重新获取 (ok={ok_code}, 重定向到登录页)")
                 self.log(f"API原始响应: {json.dumps(data, ensure_ascii=False)[:300]}", 'WARNING')
-                if 'login' in error_msg.lower() or 'cookie' in error_msg.lower():
-                    raise Exception(f"登录状态失效，请更新Cookie: {error_msg}")
                 raise Exception(f"API返回错误: {error_msg}")
             
             api_data = data.get('data', {})
+            if not isinstance(api_data, dict) or not isinstance(api_data.get('list'), list):
+                raise ValueError('超话列表响应结构异常')
+            self.authenticated = True
             chaohua_list = api_data.get('list', [])
             
             if not chaohua_list:
@@ -315,6 +307,8 @@ class WeiboChaohuaSignin:
             }
 
             response = self.session.get(url, params=params, headers=headers, timeout=15)
+            if response_requires_login(response):
+                raise AuthenticationError('签到接口要求重新登录')
             
             if response.status_code != 200:
                 return {'success': False, 'msg': f'HTTP错误: {response.status_code}'}
@@ -325,10 +319,12 @@ class WeiboChaohuaSignin:
                 return {'success': False, 'msg': '响应格式错误'}
             
             code = str(data.get('code', ''))
+            if response_requires_login(response, data):
+                raise AuthenticationError('签到接口明确返回登录失效')
             msg = data.get('msg', '未知错误')
 
             # 签到成功时从 data 中取详细消息
-            if code == '100000' and 'data' in data:
+            if code == '100000' and isinstance(data.get('data'), dict):
                 msg = data['data'].get('tipMessage', msg)
 
             # 成功的状态码: 100000(签到成功), 382004(今日已签到), 382010(其他成功状态)
@@ -342,6 +338,8 @@ class WeiboChaohuaSignin:
                 'already_signed': code == '382004'
             }
             
+        except AuthenticationError:
+            raise
         except requests.exceptions.RequestException as e:
             return {'success': False, 'msg': f'网络请求失败: {str(e)}'}
         except Exception as e:
@@ -358,14 +356,16 @@ class WeiboChaohuaSignin:
             self.log("⚠️ 未找到XSRF-TOKEN，可能影响签到功能", 'WARNING')
         
         try:
+            if self.auth_expired:
+                raise AuthenticationError('首页明确要求重新登录')
             # 获取超话列表
             self.log("📋 正在获取超话列表...")
             chaohua_list = self.fetch_chaohua_list()
             
             if not chaohua_list:
-                self.log("未获取到超话列表，请检查Cookie是否有效", 'WARNING')
+                self.log("没有关注的超话，无需签到", 'INFO')
                 return {
-                    'success': False,
+                    'success': True,
                     'total': 0,
                     'success_count': 0,
                     'already_signed_count': 0,
@@ -373,15 +373,26 @@ class WeiboChaohuaSignin:
                 }
             
             self.log(f"📊 成功获取到 {len(chaohua_list)} 个超话")
-            
+
             # 开始批量签到
             success_count = 0
             already_signed_count = 0
             fail_count = 0
             failed_list = []
-            
+            circuit_broken = False
+
+            # 当天前一轮已签成功的超话不再请求，避免第二段签到把请求量翻倍
+            state_key = self.user_info.get('uid') or (str(self.cookie_account.path) if self.cookie_account else '')
+            signed_today = load_signed_today(state_key) if state_key else set()
+            pending_list = [item for item in chaohua_list if item['id'] not in signed_today]
+            skipped = len(chaohua_list) - len(pending_list)
+            if skipped:
+                already_signed_count += skipped
+                self.log(f"⏭️ 今日已签 {skipped} 个超话，本轮跳过，剩余 {len(pending_list)} 个")
+
             def sign_batch(items, round_label=""):
                 """签到一批超话，返回 (成功数, 已签数, 失败数, 失败列表)"""
+                nonlocal circuit_broken
                 s_count = 0
                 a_count = 0
                 f_count = 0
@@ -411,6 +422,11 @@ class WeiboChaohuaSignin:
                     
                     if result['success']:
                         consecutive_382001_failures = 0  # 成功则重置计数器
+                        if state_key:
+                            try:
+                                mark_signed_today(state_key, chaohua_id)
+                            except (OSError, ValueError) as error:
+                                self.log(f"签到记录保存失败 ({type(error).__name__})", 'WARNING')
                         if result.get('already_signed'):
                             self.log(f"⚠️  [{chaohua_name}] {result['msg']}", 'WARNING')
                             a_count += 1
@@ -427,6 +443,7 @@ class WeiboChaohuaSignin:
                             consecutive_382001_failures += 1
                             if consecutive_382001_failures >= 3:
                                 self.log(f"⛔ 触发熔断保护：连续 {consecutive_382001_failures} 个超话触发 382001 频率限制，账号已被微博拉黑(冷却期)，提前终止今日任务！", 'ERROR')
+                                circuit_broken = True
                                 # 将剩下的也算作失败
                                 remaining = len(items) - i
                                 if remaining > 0:
@@ -450,13 +467,15 @@ class WeiboChaohuaSignin:
                 return s_count, a_count, f_count, f_list
             
             # ── 第一轮签到 ──
-            s, a, f, failed_list = sign_batch(chaohua_list)
+            s, a, f, failed_list = sign_batch(pending_list)
             success_count += s
             already_signed_count += a
             fail_count += f
-            
-            # ── 补签：如果有失败的，等待后再来一轮 ──
-            if failed_list:
+
+            # ── 补签：如果有失败的，等待后再来一轮；已熔断则不再请求 ──
+            if failed_list and circuit_broken:
+                self.log(f"⛔ 已触发熔断，跳过补签，{len(failed_list)} 个超话留给下一段签到", 'WARNING')
+            elif failed_list:
                 retry_wait = 60
                 self.log(f"🔄 第一轮有 {len(failed_list)} 个失败，等待 {retry_wait} 秒后开始补签...", 'WARNING')
                 time.sleep(retry_wait)
@@ -464,8 +483,6 @@ class WeiboChaohuaSignin:
                 s2, a2, f2, still_failed = sign_batch(failed_list, round_label="[补签] ")
                 success_count += s2
                 already_signed_count += a2
-                # 更新失败数：减去补签成功的
-                fail_count = fail_count - (s2 + a2) + f2 - len(failed_list) + len(still_failed)
                 fail_count = len(still_failed)  # 最终失败数 = 补签后仍然失败的
                 
                 if still_failed:
@@ -495,6 +512,7 @@ class WeiboChaohuaSignin:
             }
             
         except Exception as e:
+            self.auth_expired = isinstance(e, AuthenticationError)
             self.log(f"任务执行失败: {str(e)}", 'ERROR')
             # 提供一些常见问题的解决建议
             if 'cookie' in str(e).lower() or 'login' in str(e).lower():
@@ -508,278 +526,123 @@ class WeiboChaohuaSignin:
                 'success_count': 0,
                 'already_signed_count': 0,
                 'fail_count': 0,
-                'error': str(e)
+                'error': str(e),
+                'auth_expired': self.auth_expired,
             }
+        finally:
+            # 整个签到会话结束后保存刷新；认证失效或未确认时保留旧文件。
+            if self.cookie_account and self.authenticated and not self.auth_expired:
+                try:
+                    self.cookie_account.persist(self.session.cookies)
+                    self.log('已保存服务器更新的 Cookie')
+                except (OSError, ValueError) as error:
+                    self.log(f'Cookie 保存失败 ({type(error).__name__})', 'WARNING')
+            self.session.close()
+
+def _signed_state_path():
+    return data_dir() / '.signed_today.json'
+
+
+def _read_signed_state():
+    try:
+        state = json.loads(_signed_state_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    # 跨天自动作废，按容器本地日期（默认北京时间）计算
+    if not isinstance(state, dict) or state.get('date') != time.strftime('%Y-%m-%d'):
+        return {}
+    return state
+
+
+def load_signed_today(key):
+    """返回该账户今天已签成功（含已签过）的超话 ID 集合。"""
+    accounts = _read_signed_state().get('accounts', {})
+    return set(accounts.get(key, [])) if isinstance(accounts, dict) else set()
+
+
+def mark_signed_today(key, chaohua_id):
+    state = _read_signed_state()
+    accounts = state.get('accounts') if isinstance(state.get('accounts'), dict) else {}
+    ids = set(accounts.get(key, []))
+    ids.add(chaohua_id)
+    accounts[key] = sorted(ids)
+    path = _signed_state_path()
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps({'date': time.strftime('%Y-%m-%d'), 'accounts': accounts}),
+                         encoding='utf-8')
+    os.replace(temporary, path)
+
 
 def parse_netscape_cookies(content):
-    """解析Netscape格式的Cookie文件，返回cookie字符串"""
-    cookies = []
-    for line in content.split('\n'):
-        line = line.strip()
-        # 跳过注释和空行
-        if not line or line.startswith('#'):
-            continue
-        parts = line.split('\t')
-        if len(parts) >= 7:
-            # 格式: domain flag path secure expiry name value
-            name, value = parts[5], parts[6]
-            cookies.append(f"{name}={value}")
-    if cookies:
-        print(f"🍪 从Netscape格式解析到 {len(cookies)} 个Cookie字段")
-    return '; '.join(cookies)
+    """兼容旧调用；正常任务使用完整 CookieJar，保留真实属性。"""
+    return cookie_header(parse_cookie_content(content))
 
 
 def get_cookies():
-    """获取Cookie配置，支持环境变量、文件读取、Netscape格式"""
+    """旧接口兼容，支持从持久缓存读取更新后的环境变量账户。"""
+    return [cookie_header(account.jar) for account in load_accounts()]
 
-    def read_file(path):
-        """读取文件，自动检测Netscape格式并转换"""
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        # 检测Netscape格式
-        if content.startswith('# Netscape HTTP Cookie File'):
-            cookie_str = parse_netscape_cookies(content)
-            print(f"📄 从 {os.path.basename(path)} 解析Netscape格式Cookie")
-            return [cookie_str]
-        return None  # 返回None表示不是Netscape格式，需要进一步处理
 
-    def split_content(content):
-        """拆分cookie内容为账户列表"""
-        # 检测Netscape格式
-        if content.startswith('# Netscape HTTP Cookie File'):
-            return [parse_netscape_cookies(content)]
-
-        cookies = []
-        if '@' in content:
-            cookies = [c.strip() for c in content.split('@') if c.strip()]
-        elif '----' in content:
-            cookies = [c.strip() for c in content.split('----') if c.strip()]
-        elif '\n' in content:
-            # 按换行分割
-            lines = [c.strip() for c in content.split('\n') if c.strip()]
-            # 如果多行且每行都像是独立的cookie字符串（长度>50），则是多账户
-            if len(lines) > 1 and all(len(l) > 50 for l in lines):
-                cookies = lines
-            else:
-                cookies = [content.strip()]
-        else:
-            cookies = [content.strip()]
-        return cookies
-
-    # 优先使用多账户配置
-    cookies_env = os.getenv('WEIBO_COOKIES')
-    if cookies_env:
-        if os.path.isfile(cookies_env):
-            result = read_file(cookies_env)
-            if result:
-                return result
-            # 如果不是Netscape格式，read_file返回None，继续用原始值
-            with open(cookies_env, 'r', encoding='utf-8') as f:
-                cookies_env = f.read()
-        cookies = split_content(cookies_env)
-        if cookies:
-            print(f"🔍 检测到多账户配置，共 {len(cookies)} 个账户")
-            return cookies
-
-    # 单账户配置
-    cookie_env = os.getenv('WEIBO_COOKIE')
-    if cookie_env:
-        if os.path.isfile(cookie_env):
-            result = read_file(cookie_env)
-            if result:
-                return result
-            with open(cookie_env, 'r', encoding='utf-8') as f:
-                cookie_env = f.read().strip()
-        print("🔍 检测到单账户配置")
-        return [cookie_env]
-
-    # 检查当前目录及 data/ 子目录下是否有 cookie 文件
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    search_dirs = [
-        os.path.join(script_dir, 'data'),  # 优先：data/ 子目录（Docker 挂载）
-        script_dir,                         # 兼容：脚本同目录
-    ]
-    for search_dir in search_dirs:
-      for cookie_file in ['weibo.com_cookies.txt', 'cookie.txt', 'cookies.txt', 'cookie', '.cookie']:
-        cookie_path = os.path.join(search_dir, cookie_file)
-        if os.path.isfile(cookie_path):
-            result = read_file(cookie_path)
-            if result:
-                return result
-            # 不是Netscape格式，按普通方式处理
-            with open(cookie_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            if content:
-                cookies = split_content(content)
-                if len(cookies) > 1:
-                    print(f"📄 从 {cookie_file} 读取到 {len(cookies)} 个账户的Cookie")
-                else:
-                    print(f"📄 从 {cookie_file} 读取Cookie")
-                return cookies
-
-    return []
-
-def main():
-    """主函数"""
+def main(accounts=None, allow_renew=True):
     print("=" * 60)
     print("🌟 微博超话批量签到脚本 v1.2")
-    print("📅 支持多账户批量签到")
-    print("=" * 60)
-    
-    # 检查是否在青龙面板环境中
-    if not os.getenv('QL_DIR'):
-        print("⚠️  建议在青龙面板中运行此脚本")
-    
-    # 获取Cookie配置
-    cookies = get_cookies()
-    
-    if not cookies:
-        print("❌ 请设置环境变量 WEIBO_COOKIE 或 WEIBO_COOKIES")
-        print("💡 单账户: WEIBO_COOKIE=\"cookie内容\"")
-        print("💡 多账户: WEIBO_COOKIES=\"cookie1@cookie2@cookie3\" 或换行分割")
+    accounts = load_accounts() if accounts is None else accounts
+    if not accounts:
+        print('❌ 未找到 Cookie，请配置 Cookie 文件或运行 login.py')
         sys.exit(1)
-    
-    # 总体统计
-    total_accounts = len(cookies)
+
     all_results = []
-    
-    print(f"🎯 开始执行批量签到任务，共 {total_accounts} 个账户")
-    print("=" * 60)
-    
-    # 逐个账户执行签到
-    for i, cookie in enumerate(cookies, 1):
-        if not cookie or len(cookie) < 50:  # 简单验证Cookie长度
-            print(f"❌ 账户{i} Cookie无效，跳过")
-            continue
-        
+    print(f'🎯 开始签到，共 {len(accounts)} 个账户')
+    for index, account in enumerate(accounts, 1):
         try:
-            # 创建签到实例
-            signin = WeiboChaohuaSignin(cookie, i, total_accounts)
-            
-            # 执行签到
+            signin = WeiboChaohuaSignin(account, index, len(accounts))
             result = signin.run()
-            all_results.append({
-                'account': i,
-                'result': result
-            })
-            
-            # 账户间延迟
-            if i < total_accounts:
-                print(f"⏱️  等待 {signin.account_interval} 秒后处理下一个账户...")
+            # 登录失效和其他执行错误分别处理，按账户续期，最多重试一次。
+            if result.get('auth_expired') and allow_renew:
+                from check_cookie import do_renew
+                if do_renew(f'{account.source}: 服务端明确要求重新登录',
+                            trigger_sign=False, account=account):
+                    signin = WeiboChaohuaSignin(account.reload(), index, len(accounts))
+                    result = signin.run()
+            all_results.append(result)
+            if index < len(accounts):
                 time.sleep(signin.account_interval)
-            
-        except Exception as e:
-            print(f"❌ 账户{i} 执行失败: {str(e)}")
-            all_results.append({
-                'account': i,
-                'result': {
-                    'success': False,
-                    'total': 0,
-                    'success_count': 0,
-                    'already_signed_count': 0,
-                    'fail_count': 0,
-                    'error': str(e)
-                }
-            })
-        
-        print("-" * 60)
-    
-    # 输出总体统计
-    print("🏆 全部账户签到完成！")
-    print("=" * 60)
-    print("📊 总体统计结果:")
-    
-    total_success = 0
-    total_already_signed = 0
-    total_fail = 0
-    total_topics = 0
-    success_accounts = 0
-    
-    for account_result in all_results:
-        account = account_result['account']
-        result = account_result['result']
-        
-        if result['success']:
-            success_accounts += 1
-            total_success += result['success_count']
-            total_already_signed += result['already_signed_count']
-            total_fail += result['fail_count']
-            total_topics += result['total']
-            
-            print(f"✅ 账户{account}: 成功{result['success_count']} | 已签{result['already_signed_count']} | 失败{result['fail_count']} | 总计{result['total']}")
-        else:
-            error_msg = result.get('error', '未知错误')
-            print(f"❌ 账户{account}: 执行失败 - {error_msg}")
-    
-    print("-" * 60)
-    print(f"🎯 成功执行账户: {success_accounts}/{total_accounts}")
-    print(f"✅ 总签到成功: {total_success} 个超话")
-    print(f"⚠️  总已签过: {total_already_signed} 个超话")
-    print(f"❌ 总签到失败: {total_fail} 个超话")
-    print(f"📊 总处理超话: {total_topics} 个超话")
-    
-    # 执行结果判断
-    if success_accounts > 0:
-        print("🎉 批量签到任务执行完成！")
-        if total_success > 0:
-            print(f"🌟 本次新增签到 {total_success} 个超话")
-    else:
-        print("⚠️  所有账户均执行失败，尝试自动续期Cookie...")
-        
-        # 尝试自动续期
-        renewed = False
-        try:
-            from check_cookie import do_renew
-            renewed = do_renew("签到时检测到所有账户Cookie已失效", trigger_sign=False)
-        except Exception as e:
-            print(f"⚠️ 自动续期调用失败: {e}")
-        
-        if renewed:
-            print("✅ Cookie已自动更新，重新执行签到...")
-            # 重新读取Cookie并签到
-            new_cookies = get_cookies()
-            if new_cookies:
-                for i, cookie in enumerate(new_cookies, 1):
-                    if not cookie or len(cookie) < 50:
-                        continue
-                    try:
-                        signin = WeiboChaohuaSignin(cookie, i, len(new_cookies))
-                        result = signin.run()
-                        if result['success']:
-                            success_accounts += 1
-                            total_success += result['success_count']
-                            total_already_signed += result['already_signed_count']
-                            total_fail += result['fail_count']
-                            total_topics += result['total']
-                    except Exception as e:
-                        print(f"❌ 续期后重试账户{i}失败: {e}")
-        
-        if success_accounts == 0:
-            print("⚠️  Cookie续期失败或续期后签到仍失败")
-            send_notify(
-                '微博超话签到失败 - Cookie已过期',
-                f'所有{total_accounts}个账户均签到失败，请手动更新Cookie文件。\n时间: {time.strftime("%Y-%m-%d %H:%M:%S")}'
-            )
-            sys.exit(1)
+        except Exception as error:
+            print(f'❌ 账户{index}执行异常 ({type(error).__name__})')
+            all_results.append({'success': False, 'total': 0, 'success_count': 0,
+                                'already_signed_count': 0, 'fail_count': 0,
+                                'error': type(error).__name__})
 
-    # 发送每日签到汇总通知
-    notify_msg = []
-    notify_msg.append(f"⏱ 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    notify_msg.append(f"👤 账户: {success_accounts}/{total_accounts} 成功")
-    notify_msg.append(f"✅ 签到成功: {total_success} 个超话")
-    notify_msg.append(f"⚠ 已签过: {total_already_signed} 个超话")
-    if total_fail > 0:
-        notify_msg.append(f"❌ 签到失败: {total_fail} 个超话")
-    send_notify('微博超话签到完成', '\n'.join(notify_msg))
+    success_accounts = sum(bool(result['success']) for result in all_results)
+    total_success = sum(result.get('success_count', 0) for result in all_results)
+    total_already_signed = sum(result.get('already_signed_count', 0) for result in all_results)
+    total_fail = sum(result.get('fail_count', 0) for result in all_results)
+    total_topics = sum(result.get('total', 0) for result in all_results)
+    print(f'🎯 成功执行账户: {success_accounts}/{len(accounts)}')
+    print(f'✅ 签到成功: {total_success} | 已签: {total_already_signed} | 失败: {total_fail} | 总计: {total_topics}')
+    if not success_accounts:
+        send_notify('微博超话签到执行失败',
+                    '所有账户执行失败，请查看签到日志。网络超时、限流和接口错误不会自动触发扫码。')
+        sys.exit(1)
+    notify_msg = (
+        f'⏱ 时间: {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+        f'👤 账户: {success_accounts}/{len(accounts)} 成功\n'
+        f'✅ 签到成功: {total_success} 个超话\n'
+        f'⚠ 已签过: {total_already_signed} 个超话\n'
+        f'❌ 签到失败: {total_fail} 个超话'
+    )
+    send_notify('微博超话签到完成', notify_msg)
 
-    print("=" * 60)
 
 if __name__ == "__main__":
     # 开始时间记录
     start_time = time.time()
     
     try:
-        main()
+        with task_lock():
+            main()
+    except TaskBusy as error:
+        print(f"[*] {error}")
     except KeyboardInterrupt:
         print("\n⚠️  用户中断执行")
         sys.exit(0)
@@ -791,4 +654,3 @@ if __name__ == "__main__":
         end_time = time.time()
         duration = int(end_time - start_time)
         print(f"⏱️  总耗时: {duration} 秒")
-

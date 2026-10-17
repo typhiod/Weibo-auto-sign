@@ -6,22 +6,24 @@ cron: 0 22 * * *
 new Env('微博Cookie检测');
 
 运行逻辑：
-  1. 读取 Netscape Cookie 文件，检查 ALF/SUB 关键 token 的过期时间
-  2. 若距过期 <= RENEW_AHEAD_DAYS 天（默认7天），则触发续期
-  3. 若文件检测通过，再做一次轻量 API 验证，防止服务端提前吊销
+  1. 实际验证每个账户的登录状态，接收并保存服务器更新的 Cookie
+  2. 验证有效后检查 ALF/SUB/SUBP 的真实过期时间
+  3. 明确失效或验证后仍临近到期才触发扫码；网络异常不触发扫码
   4. 续期方式：获取微博二维码 → 发送到 Telegram → 等待用户扫码 → 自动写入新 Cookie
 """
 
 import os
 import sys
 import time
-import requests
+from cookie_store import (
+    TaskBusy, key_expiries, load_accounts, make_session, read_cookie_file,
+    task_lock, validate_session,
+)
 
 # 确保可以 import 同目录的 login.py / wb.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from login import (
-    SESSION,
     COOKIE_FILE,
     get_qr_code,
     send_telegram_photo,
@@ -41,37 +43,10 @@ QR_TIMEOUT = int(os.getenv('QR_TIMEOUT', '300'))
 # ── 工具函数 ─────────────────────────────────────────────────
 
 def parse_key_expiries(cookie_file):
-    """
-    解析 Netscape 格式 Cookie 文件，返回关键 token 的
-    {name: expiry_timestamp} 字典。
-    重点关注 ALF（登录凭证）、SUB（会话 token）、SUBP（扩展会话）。
-    """
-    key_tokens = {'ALF', 'SUB', 'SUBP'}
-    expiries = {}
-
+    """只读取微博根域登录凭证的真实过期时间。"""
     if not os.path.isfile(cookie_file):
-        return expiries
-
-    try:
-        with open(cookie_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split('\t')
-                # Netscape 格式：domain flag path secure expiry name value
-                if len(parts) >= 7:
-                    name = parts[5]
-                    expiry_str = parts[4]
-                    if name in key_tokens and expiry_str.isdigit():
-                        expiry = int(expiry_str)
-                        # 过期时间为 0 表示 session cookie，忽略
-                        if expiry > 0:
-                            expiries[name] = expiry
-    except Exception as e:
-        print(f"[!] 解析 Cookie 文件失败: {e}")
-
-    return expiries
+        return {}
+    return key_expiries(read_cookie_file(cookie_file))
 
 
 def check_expiry(expiries):
@@ -99,55 +74,16 @@ def check_expiry(expiries):
 
 
 def validate_cookie_via_api(cookie_str):
-    """
-    通过轻量 API 实际验证 Cookie 是否被服务端认可。
-    返回：
-      True  — 有效
-      False — 已失效（ok=-100 或重定向到登录页）
-      None  — 网络异常，无法判断（不触发续期）
-    """
-    s = requests.Session()
-    s.headers.update({
-        'User-Agent': SESSION.headers.get('User-Agent', 'Mozilla/5.0'),
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://weibo.com/',
-    })
-    for item in cookie_str.split('; '):
-        item = item.strip()
-        if '=' in item:
-            k, v = item.split('=', 1)
-            s.cookies.set(k.strip(), v.strip())
-
-    try:
-        resp = s.get(
-            'https://weibo.com/ajax/profile/info',
-            params={'uid': ''},
-            timeout=15
-        )
-        data = resp.json()
-        ok_code = data.get('ok', 0)
-        if ok_code == -100:
-            return False
-        # ok=1 或其他非 -100 均视为有效
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"[!] 网络请求失败，跳过 API 验证: {e}")
-        return None
-    except Exception as e:
-        print(f"[!] API 验证异常: {e}")
-        return None
-
-
-def get_cookie_str_from_file():
-    """从 Cookie 文件读取 cookie 字符串（复用 wb.py 的解析逻辑）"""
-    from wb import get_cookies
-    cookies = get_cookies()
-    return cookies[0] if cookies else None
+    """兼容旧调用：True 有效、False 明确失效、None 无法确认。"""
+    with make_session(cookie_str) as session:
+        valid, reason = validate_session(session)
+        print(f"[*] {reason}")
+        return valid
 
 
 # ── 续期流程 ─────────────────────────────────────────────────
 
-def do_renew(reason, trigger_sign=True):
+def do_renew(reason, trigger_sign=True, account=None):
     """
     触发 Telegram 扫码续期流程。
     返回 True 表示成功，False 表示失败/超时。
@@ -161,14 +97,13 @@ def do_renew(reason, trigger_sign=True):
         print("    请在 docker-compose.yml 中设置 TG_TOKEN 和 TG_CHAT_ID")
         return False
 
-    send_telegram_message(
-        f"⚠️ 微博 Cookie 需要续期！\n"
-        f"📋 原因：{reason}\n\n"
-        f"📲 正在生成登录二维码，请准备好微博 APP 扫码...\n"
-        f"⏰ 等待时长：{QR_TIMEOUT // 60} 分钟"
-    )
-
     try:
+        send_telegram_message(
+            f"⚠️ 微博 Cookie 需要续期！\n"
+            f"📋 原因：{reason}\n\n"
+            f"📲 正在生成登录二维码，请准备好微博 APP 扫码...\n"
+            f"⏰ 等待时长：{QR_TIMEOUT // 60} 分钟"
+        )
         # 1. 获取二维码
         qrid, qr_bytes = get_qr_code()
 
@@ -176,7 +111,8 @@ def do_renew(reason, trigger_sign=True):
         caption = (
             "📱 请用微博 APP 扫描此二维码重新登录\n"
             "✅ 扫码并确认后 Cookie 将自动更新并立即执行签到\n"
-            f"⏰ 二维码有效期：5 分钟"
+            f"⏰ 等待扫码：{QR_TIMEOUT} 秒\n"
+            f"👤 {account.source if account else '默认账户'}"
         )
         if not send_telegram_photo(qr_bytes, caption):
             print("[-] 二维码发送 Telegram 失败")
@@ -191,18 +127,20 @@ def do_renew(reason, trigger_sign=True):
             print("[-] 扫码超时或二维码失效")
             send_telegram_message(
                 "❌ 扫码超时，Cookie 未更新\n"
-                "📅 明天 22:00 将再次自动检测并发送二维码"
+                "📅 下次 Cookie 检测任务将再次检查"
             )
             return False
 
         # 4. 获取并保存新 Cookie
-        cookie_str = process_login(alt_url)
-        save_cookie_netscape(cookie_str)
+        process_login(alt_url)
+        save_cookie_netscape(cookie_file=account.path if account else COOKIE_FILE)
+        if account:
+            account.reload()
 
         send_telegram_message(
             "✅ 微博 Cookie 已自动更新成功！\n"
-            f"📅 新 Cookie 有效期约 1~3 个月\n"
-            "🚀 正在为您立即执行超话签到，避免当天漏签..."
+            "📅 已保留服务端实际过期时间\n"
+            + ("🚀 正在执行超话签到..." if trigger_sign else "🚀 将重试当前账户的超话签到")
         )
         print("[+] Cookie 续期成功，新 Cookie 已写入文件")
 
@@ -211,17 +149,20 @@ def do_renew(reason, trigger_sign=True):
             try:
                 print("[*] 正在执行自动签到任务...")
                 from wb import main as run_wb_main
-                run_wb_main()
+                run_wb_main(accounts=[account] if account else None, allow_renew=False)
             except SystemExit:
                 pass
             except Exception as e:
-                print(f"[!] 自动签到触发异常: {e}")
+                print(f"[!] 自动签到触发异常 ({type(e).__name__})")
 
         return True
 
     except Exception as e:
-        print(f"[-] 续期过程发生异常: {e}")
-        send_telegram_message(f"❌ Cookie 自动续期失败\n错误信息：{e}")
+        print(f"[-] 续期过程发生异常 ({type(e).__name__})")
+        try:
+            send_telegram_message(f"❌ Cookie 自动续期失败\n错误类型：{type(e).__name__}")
+        except Exception:
+            print('[!] 续期失败通知未能发送')
         return False
 
 
@@ -232,55 +173,43 @@ def main():
     print("  微博 Cookie 健康检测")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  提前续期阈值: {RENEW_AHEAD_DAYS} 天")
-    print(f"  Cookie 文件: {COOKIE_FILE}")
     print("=" * 50)
+    accounts = load_accounts()
+    if not accounts:
+        print('[!] 未找到 Cookie，尝试首次扫码登录')
+        return 0 if do_renew('未找到 Cookie') else 1
 
-    need_renew = False
-    renew_reason = ""
-
-    # ── Step 1: 解析 Netscape 文件，检查过期时间 ──────────────
-    expiries = parse_key_expiries(COOKIE_FILE)
-    if expiries:
-        token_info = ', '.join(
-            f"{k}={time.strftime('%Y-%m-%d', time.localtime(v))}"
-            for k, v in sorted(expiries.items(), key=lambda x: x[1])
-        )
-        print(f"[*] 关键 Token 过期日期: {token_info}")
-
-        need_renew, reason_msg, days_left = check_expiry(expiries)
-        print(f"[{'!' if need_renew else '+'}] {reason_msg}")
-
-        if need_renew:
-            renew_reason = reason_msg
-    else:
-        print("[!] 未在 Cookie 文件中找到有效的过期时间字段，将跳过时间检测")
-
-    # ── Step 2: 若时间检测通过，再做 API 实时验证 ───────────────
-    if not need_renew:
-        print("[*] 正在通过 API 验证 Cookie 有效性...")
-        cookie_str = get_cookie_str_from_file()
-
-        if cookie_str:
-            valid = validate_cookie_via_api(cookie_str)
-            if valid is True:
-                print("[+] API 验证通过，Cookie 有效")
-            elif valid is False:
-                need_renew = True
-                renew_reason = "API 验证失败，Cookie 已被服务端吊销"
-                print(f"[!] {renew_reason}")
-            else:
-                print("[!] 网络异常，跳过 API 验证，不触发续期")
-        else:
-            print("[!] 未能读取 Cookie 内容，跳过 API 验证")
-
-    # ── Step 3: 触发续期或正常退出 ───────────────────────────────
-    if need_renew:
-        success = do_renew(renew_reason)
-        sys.exit(0 if success else 1)
-    else:
-        print("[+] Cookie 状态良好，无需续期 ✅")
-        sys.exit(0)
+    failures = 0
+    for account in accounts:
+        print(f'[*] 检测 {account.source}')
+        try:
+            # 先尝试实际访问并接收刷新，避免根据旧文件过早要求扫码。
+            with make_session(account.jar) as session:
+                valid, reason = validate_session(session)
+                if valid is None:
+                    print(f'[!] 无法确认登录状态: {reason}；保留原 Cookie，不触发扫码')
+                    failures += 1
+                    continue
+                if valid is True:
+                    account.persist(session.cookies)
+                    need_renew, expiry_reason, _ = check_expiry(key_expiries(session.cookies))
+                    print(f'[+] 登录有效，Cookie 已保存；{expiry_reason}')
+                    if not need_renew:
+                        continue
+                    reason = expiry_reason
+                else:
+                    print(f'[!] 登录已失效: {reason}')
+            if not do_renew(f'{account.source}: {reason}', account=account):
+                failures += 1
+        except (OSError, ValueError) as error:
+            print(f'[!] Cookie 读取/保存失败 ({type(error).__name__})，不触发扫码')
+            failures += 1
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        with task_lock():
+            sys.exit(main())
+    except TaskBusy as error:
+        print(f'[*] {error}')

@@ -3,7 +3,7 @@ set -euo pipefail
 
 TZ="${TZ:-Asia/Shanghai}"
 SIGN_CRON="${SIGN_CRON:-0 0 * * *}"
-HEARTBEAT_CRON="${HEARTBEAT_CRON:-0 */6 * * *}"
+HEARTBEAT_CRON="${HEARTBEAT_CRON:-5 */6 * * *}"
 CHECK_COOKIE_CRON="${CHECK_COOKIE_CRON:-0 22 * * *}"
 PYTHON_BIN="${PYTHON_BIN:-/usr/local/bin/python3}"
 RUN_STARTUP_CATCHUP="${RUN_STARTUP_CATCHUP:-1}"
@@ -15,9 +15,9 @@ STARTUP_SIGN_STAMP="/app/logs/.last_startup_sign_date"
 echo "========================================"
 echo "  微博超话签到 Docker 容器"
 echo "  时区: $TZ"
-echo "  Cookie检测: 每天 22:00"
-echo "  签到: 每天 00:00"
-echo "  保活: 每 6 小时"
+echo "  Cookie检测: $CHECK_COOKIE_CRON"
+echo "  签到: $SIGN_CRON"
+echo "  保活: $HEARTBEAT_CRON"
 echo "========================================"
 
 if [ ! -x "$PYTHON_BIN" ]; then
@@ -30,6 +30,14 @@ if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 mkdir -p /app/logs /app/data
+
+# Debian cron 不支持 CRON_TZ，按运行时 TZ 更新系统时区，修改 TZ 后定时任务才会跟着变
+if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+    ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+    echo "$TZ" > /etc/timezone
+else
+    echo "[!] 未知时区 $TZ，沿用镜像默认时区"
+fi
 touch /app/logs/sign.log /app/logs/heartbeat.log /app/logs/check_cookie.log
 
 # 检查Cookie文件
@@ -110,7 +118,8 @@ run_startup_catchup() {
     fi
 }
 
-run_startup_catchup
+# 后台补签，不阻塞 cron 启动；与定时签到的并发由任务锁处理
+run_startup_catchup &
 
 echo "[*] 启动 cron 守护进程..."
 echo ""
